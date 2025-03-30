@@ -25,7 +25,7 @@ class SimWriter:
         OpSimSurvey,
         out_path=None,
         author_name=None,
-        ZPTNoise=0.005,
+        ZPTNoise=0.000,
         CCDgain=1.0,
         CCDnoise=0.25,
         outfile_ext=".SIMLIB",
@@ -107,9 +107,9 @@ class SNANA_Simlib(SimWriter):
         out_path=None,
         author_name=None,
         file_suffix="",
-        ZPTNoise=0.005,
+        ZPTNoise=0.000,
         CCDgain=1.0,
-        CCDnoise=0.25,
+        CCDnoise=0.0,
         NOTES={},
     ):
         """Construct the SNANA Simlib class."""
@@ -134,11 +134,14 @@ class SNANA_Simlib(SimWriter):
         str
             DOCUMENTATION string
         """
-        minMJD = self.OpSimSurvey.opsimdf["observationStartMJD"].min()
-        maxMJD = self.OpSimSurvey.opsimdf["observationStartMJD"].max()
+        print("\n[DEBUG] opsimdf  key:", self.OpSimSurvey.opsimdf.columns.tolist())
+        print("[DEBUG] opsimdf attrs:", list(self.OpSimSurvey.opsimdf.attrs.keys()))
+
+        minMJD = self.OpSimSurvey.opsimdf["MJD"].min()
+        maxMJD = self.OpSimSurvey.opsimdf["MJD"].max()
         OpSimFile = self.OpSimSurvey.opsimdf.attrs["OpSimFile"]
         doc = "DOCUMENTATION:\n"
-        doc += f"    PURPOSE: simulate LSST based on mock opsim version {OpSimFile}\n"
+        doc += f"    PURPOSE: simulate DEBASS (DECAM) based on mock opsim version {OpSimFile}\n"
         doc += "    INTENT:   Nominal\n"
         doc += "    USAGE_KEY: SIMLIB_FILE\n"
         doc += "    USAGE_CODE: snlc_sim.exe\n"
@@ -146,12 +149,6 @@ class SNANA_Simlib(SimWriter):
         doc += "    NOTES: \n"
         doc += "        PARAMS MINMJD: {:.4f}\n".format(minMJD)
         doc += "        PARAMS MAXMJD: {:.4f}\n".format(maxMJD)
-        doc += "        PARAMS TOTAL_AREA: {:.3f}\n".format(
-            self.OpSimSurvey.survey.attrs["survey_area_deg"]
-        )
-        doc += "        PARAMS SOLID_ANGLE: {:.3f}\n".format(
-            self.OpSimSurvey.survey.attrs["survey_area_rad"]
-        )
         if self.OpSimSurvey.survey_hosts is not None:
             doc += "        ASSOCIATED HOSTLIB: {}\n".format(
                 self.out_path.with_suffix(".HOSTLIB").absolute()
@@ -187,10 +184,11 @@ class SNANA_Simlib(SimWriter):
             host = os.getenv("HOSTNAME")
         except:
             host = "NONE"
-        # comment: I would like to generalize ugrizY to a sort but am not sure
+        # comment: I would like to generalize ugriz to a sort but am not sure
         # of the logic for other filter names. so ducking for now
+        # TODO: check with Dillon --TZ
         header = "\n\n\n"
-        header += "SURVEY: LSST   FILTERS: ugrizY  TELESCOPE: LSST\n"
+        header += "SURVEY: DES   FILTERS: griz   TELESCOPE: DEBASS\n"
         header += "USER: {0:}     HOST: {1}\n".format(user, host)
         header += f"NLIBID: {len(self.OpSimSurvey.survey)}\n"
         header += "NPE_PIXEL_SATURATE:   100000\n"
@@ -200,85 +198,122 @@ class SNANA_Simlib(SimWriter):
         return header
 
     def LIBheader(
-        self, LIBID, ra, dec, opsimdf, mwebv=0.0, groupID=None, field_label=None
+            self, LIBID, ra, dec, opsimdf, mwebv=0.0, groupID=None, field_label=None,
+            redshift=None, peakMJD=None, template_zpt=None, template_skysig=None
     ):
-        """Give the string of the header of a LIB entry.
+        """Return the header string of a LIB entry including additional original content.
 
         Parameters
         ----------
-        LIBID : int
+        LIBID : int or str
             The LIBID of the entry.
         ra : float
-            RA [deg] coordinate of the entry
+            RA [deg] coordinate of the entry.
         dec : float
-            Dec [deg] coordinate of the entry
+            Dec [deg] coordinate of the entry.
         opsimdf : pandas.DataFrame
-            LIB entry observations
-        mwebv: float, optional
-            MWEBV of the entry, default = 0.0
+            DataFrame of the LIB entry observations.
+        mwebv : float, optional
+            MWEBV of the entry, default = 0.0.
         groupID : int, optional
-            GROUPID of the entry used to match with HOSTLIB hosts.
+            GROUPID for matching with HOSTLIB hosts.
+        field_label : str, optional
+            Label for the field.
+        redshift : float, optional
+            Redshift value to include.
+        peakMJD : float, optional
+            The PEAKMJD value; if provided, a cadence comment will be added.
+        template_zpt : list of float, optional
+            Template zero points.
+        template_skysig : list of float, optional
+            Template sky noise values.
 
         Returns
         -------
         str
             The LIB entry header string.
         """
-        nobs = len(opsimdf)
         # String formatting
         s = "# --------------------------------------------" + "\n"
-        s += "LIBID: {0:10d}".format(LIBID) + "\n"
-        tmp = "RA: {0:+10.6f} DEC: {1:+10.6f}   NOBS: {2:10d} MWEBV: {3:5.2f}"
-        tmp += " PIXSIZE: {4:5.3f}"
-        s += tmp.format(ra, dec, nobs, mwebv, self.OpSimSurvey.__LSST_pixelSize__)
+
+        libid_int = int(LIBID)
+
+        if peakMJD is not None:
+            int_peakMJD = float(peakMJD)
+            # Compute the minimum delta between each observation's MJD and the provided peakMJD.
+            s += "LIBID: {0:10d}     # cadence from PEAKMJD= {1:+.1f}\n".format(libid_int,
+                                                                                                       int_peakMJD)
+        else:
+            s += "LIBID: {0:10d}\n".format(libid_int)
+
+        # RA, DEC, and MWEBV line (formatted similarly to the original file)
+        s += "RA: {0:10.6f}        DEC: {1:10.6f}     MWEBV: {2:7.4f}\n".format(float(ra), float(dec), float(mwebv))
+
+        # NOBS and PIXSIZE line, with optional REDSHIFT and PEAKMJD added.
+        nobs = int(len(opsimdf))
+        s += "NOBS: {0:10d} PIXSIZE: {1:5.3f}".format(nobs, self.OpSimSurvey.__DEBASS_pixelSize__)
+        if redshift is not None:
+            redshift=float(redshift)
+            s += "     REDSHIFT: {0:7.5f}".format(redshift)
+        if peakMJD is not None:
+            int_peakMJD = float(peakMJD)
+            s += "     PEAKMJD: {0:9.3f}".format(int_peakMJD)
+        s += "\n"
+
+        # Add TEMPLATE_ZPT line if provided.
+        if template_zpt is not None:
+            s += "TEMPLATE_ZPT:"
+            s += template_zpt
+            s += "\n"
+
+        # Add TEMPLATE_SKYSIG line if provided.
+        if template_skysig is not None:
+            s += "TEMPLATE_SKYSIG:"
+            s += template_skysig
+            s += "\n"
+
+        # Optionally include the field label and groupID.
         if field_label is not None:
-            s += f" FIELD: {field_label}"
+            s += "FIELD: {0}\n".format(field_label)
         if groupID is not None:
-            s += f"\nHOSTLIB_GROUPID: {groupID}"
-        s += "\n#                           CCD  CCD         PSF1 PSF2 PSF2/1" + "\n"
+            s += "HOSTLIB_GROUPID: {0}\n".format(groupID)
+        s +=  "\n"
         s += (
-            "#     MJD      ID*NEXPOSE  FLT GAIN NOISE SKYSIG (pixels)  RATIO  ZPTAVG ZPTERR  MAG"
+            "#     MJD      IDEXPT  BAND GAIN RDNOISE SKYSIG (pixels)  RATIO  ZP ZPERR  MAG"
             + "\n"
         )
         return s
 
     def _init_dataline(self):
-        f = lambda expMJD, ObsID, BAND, SKYSIG, PSF, ZPT: ut.dataline(
+        f = lambda expMJD, ObsID, BAND, GAIN, SKYSIG, PSF, ZP: ut.dataline(
             expMJD,
             ObsID,
             BAND,
-            self.CCDgain,
+            GAIN,
             self.CCDnoise,
             SKYSIG,
             PSF,
-            ZPT,
+            ZP,
             self.ZPTNoise,
         )
 
         return np.vectorize(f)
 
     def LIBdata(self, opsimdf):
-        """Give the string of a LIB entry.
+        """Give the string of a LIB entry."""
+        if opsimdf.empty:
+            return ""
 
-        Parameters
-        ----------
-        opsimdf : pandas.DataFrame
-            LIB entry observations
-
-        Returns
-        -------
-        str
-            The str of the LIB entry.
-        """
         opsimdf["BAND"] = opsimdf["BAND"].map(lambda x: x.upper() if x == "y" else x)
         lib = "\n".join(
             self.dataline(
-                opsimdf["expMJD"].values,
-                opsimdf["ObsID"].values,
+                opsimdf["MJD"].values,
+                opsimdf["IDEXPT"].values,  # use IDEXPT instead of ObsID
                 opsimdf["BAND"].values,
+                opsimdf["GAIN"].values,
                 opsimdf["SKYSIG"].values,
-                opsimdf["PSF"].values,
-                opsimdf["ZPT"].values,
+                opsimdf["PSF1"].values,
+                opsimdf["ZP"].values,
             )
         )
         return lib + "\n"
@@ -296,15 +331,15 @@ class SNANA_Simlib(SimWriter):
         str
             The string of a LIB entry footer
         """
-        footer = "END_LIBID: {0:10d}".format(LIBID)
+        libid_int = int(LIBID)
+        footer = "END_LIBID: {0:10d}".format(libid_int)
+        footer += "\n"
         footer += "\n"
         return footer
 
     def get_SIMLIB_footer(self):
         """Give SIMLIB footer."""
-        s = "END_OF_SIMLIB:    {0:10d} ENTRIES".format(
-            self.OpSimSurvey.survey.attrs["N_fields"]
-        )
+        s = "END_OF_SIMLIB:    "
         return s
 
     def write_SIMLIB(self, write_batch_size=10, buffer_size=8192):
@@ -326,30 +361,38 @@ class SNANA_Simlib(SimWriter):
 
             bcount = 0
             simlibstr = ""
-            for (i, field), obs in zip(
-                self.OpSimSurvey.survey.iterrows(), self.OpSimSurvey.get_survey_obs()
-            ):
-                LIBID = i
-                RA = np.degrees(field["hp_ra"])
-                DEC = np.degrees(field["hp_dec"])
+            # Iterate over unique survey fields
+            for idx, field in self.OpSimSurvey.survey.iterrows():
+                LIBID = field["LIBID"]
+                RA = field["fieldRA"]
+                DEC = field["fieldDec"]
                 if self.OpSimSurvey.survey_hosts is not None:
                     groupID = LIBID
                 else:
                     groupID = None
-                if "field_label" in field:
-                    field_label = field["field_label"]
-                else:
-                    field_label = None
+                field_label = field.get("field_label", None)
+
+                # Get all observations corresponding to this field (grouped by LIBID)
+                obs = self.OpSimSurvey.opsimdf[self.OpSimSurvey.opsimdf["LIBID"] == LIBID]
+                # Write header once per field
                 simlibstr += self.LIBheader(
-                    LIBID, RA, DEC, obs, groupID=groupID, field_label=field_label
+                    LIBID, RA, DEC, obs,
+                    groupID=groupID,
+                    field_label=field_label,
+                    redshift=field.get("REDSHIFT", None),
+                    peakMJD=field.get("PEAKMJD", None),
+                    template_zpt=field.get("TEMPLATE_ZPT", None),
+                    template_skysig=field.get("TEMPLATE_SKYSIG", None)
                 )
+                # Write all data lines for this field
                 simlibstr += self.LIBdata(obs)
+                # Write footer once per field
                 simlibstr += self.LIBfooter(LIBID)
 
+                # Write batch if needed
                 if not bcount % write_batch_size:
                     simlib_file.write(simlibstr)
                     simlibstr = ""
-
                 bcount += 1
 
             simlib_file.write(simlibstr)
@@ -378,7 +421,7 @@ class SNANA_Simlib(SimWriter):
         """
         doc = (
             "DOCUMENTATION:\n"
-            "PURPOSE: HOSTLIB for LSST based on mock opsim\n"
+            "PURPOSE: HOSTLIB for DEBASS based on mock opsim\n"
             "    VERSIONS:\n"
             f"    - DATE : {self.date_time}\n"
             f"    - ASSOCIATED SIMLIB : {self.out_path.absolute()}\n"
@@ -399,7 +442,7 @@ class SNANA_Simlib(SimWriter):
         Returns
         -------
         str
-            Header of HSOTLIB file
+            Header of HOSTLIB file
         """
         header = (
             f"# Z_MIN={hostdf.ZTRUE_CMB.min()} Z_MAX={hostdf.ZTRUE_CMB.max()}\n\n"
@@ -471,10 +514,10 @@ class SNSIM_obsfile(SimWriter):
 
         if write_field_map:
             survey_config["field_map"] = str(
-                self.out_path.with_stem("LSST_field_map").with_suffix(".dat")
+                self.out_path.with_stem("DEBASS_field_map").with_suffix(".dat")
             )
         else:
-            survey_config["field_map"] = "PATH/TO/LSST_FIELD_MAP"
+            survey_config["field_map"] = "PATH/TO/DEBASS_FIELD_MAP"
         return survey_config
 
     def write_survey_file(self, write_survey_conf=True, write_field_map=True):
@@ -485,7 +528,8 @@ class SNSIM_obsfile(SimWriter):
         print(f"Writing obs file in {self.out_path}")
 
         obs = self.OpSimSurvey.formatObs(self.OpSimSurvey.opsimdf)
-        obs["BAND"] = obs["BAND"].map(lambda x: "lsst" + x)
+       # obs["BAND"] = obs["BAND"].map(lambda x: "lsst" + x)
+        obs["BAND"] = obs["BAND"].map(lambda x: "des" + x) #TODO: ???????
 
         obs.rename(
             columns={
@@ -522,13 +566,13 @@ class SNSIM_obsfile(SimWriter):
             with open(survey_conf_path, "w") as file:
                 yaml.safe_dump(yaml_dic, file, default_flow_style=None, indent=4)
 
-        LSST_field_map_path = self.out_path.with_stem("LSST_field_map").with_suffix(
+        DEBASS_field_map_path = self.out_path.with_stem("DEBASS_field_map").with_suffix(
             ".dat"
         )
-        print(f"Writing LSST field map file in {LSST_field_map_path}")
+        print(f"Writing DEBASS field map file in {DEBASS_field_map_path}")
         if write_field_map:
-            with open(LSST_field_map_path, "w") as file:
-                file.write(self.get_LSST_field())
+            with open(DEBASS_field_map_path, "w") as file:
+                file.write(self.get_DEBASS_field())
 
     @staticmethod
     def get_LSST_field():
@@ -544,3 +588,19 @@ class SNSIM_obsfile(SimWriter):
             ["-1:#:-1:#:-1:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:-1:#:-1:#:-1\n"] * 3
         )
         return LSST_field_header + "@\n".join(LSST_field)
+
+    @staticmethod
+    def get_DEBASS_field():
+        DEBASS_field_header = "% #:ra:0.0028\n"
+        DEBASS_field_header += "% @:dec:0.0028\n\n"
+        DEBASS_field = [
+            "-1:#:-1:#:-1:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:-1:#:-1:#:-1\n"
+        ] * 3
+        DEBASS_field.extend(
+            ["0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0\n"] * 9
+        )
+        DEBASS_field.extend(
+            ["-1:#:-1:#:-1:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:0:#:-1:#:-1:#:-1\n"] * 3
+        )
+        return DEBASS_field_header + "@\n".join(DEBASS_field)
+

@@ -100,7 +100,7 @@ def host_joiner(survey_fields, host):
     return survey_host
 
 
-def dataline(expMJD, ObsID, BAND, CCDgain, CCDnoise, SKYSIG, PSF, ZPT, ZPTNoise):
+def dataline(expMJD, IDEXPT, BAND, CCDgain, CCDnoise, SKYSIG, PSF, ZPT, ZPTNoise):
     """Write a SIMLIB data line
 
     Parameters
@@ -132,7 +132,7 @@ def dataline(expMJD, ObsID, BAND, CCDgain, CCDnoise, SKYSIG, PSF, ZPT, ZPTNoise)
     l = (
         "S: "
         f"{expMJD:5.4f} "
-        f"{ObsID:10d}*2 "
+        f"{IDEXPT:10d} "  
         f"{BAND} "
         f"{CCDgain:5.2f} "  # CCD Gain
         f"{CCDnoise:5.2f} "  # CCD Noise

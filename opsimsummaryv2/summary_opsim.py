@@ -22,6 +22,7 @@ import sqlalchemy as sqla
 from sklearn.neighbors import BallTree
 from astropy.time import Time
 from . import utils as ut
+from .new_uti import def_host_joiner
 
 
 class OpSimSurvey:
@@ -48,8 +49,8 @@ class OpSimSurvey:
         The hosts that are inside the survey.
     """
 
-    __LSST_FIELD_RADIUS__ = np.radians(1.75)  # LSST Field Radius in radians
-    __LSST_pixelSize__ = 0.2  # LSST Pixel size in arcsec^-1
+    __DEBASS_FIELD_RADIUS__ = np.radians(1.1)  # DEBASS Field Radius in radians
+    __DEBASS_pixelSize__ = 0.263  # DECAM Pixel size in arcsec^-1
 
     def __init__(
         self,
@@ -85,8 +86,10 @@ class OpSimSurvey:
 
         self.host = self._read_host_file(host_file, **host_config)
 
-        self._hp_rep = None
+        # Instead of a healpy representation, we build a field representation
+        self._field_rep = None  # DataFrame of unique DEBASS field centers
         self._survey = None
+
 
     @staticmethod
     def _get_sql_engine(dbname):
@@ -113,36 +116,46 @@ class OpSimSurvey:
 
     @staticmethod
     def _get_df_from_sql(sql_engine, MJDrange=None):
-        """Load data from the db file.
-
-        Parameters
-        ----------
-        sql_engine : sqlalchemy.engine.base.Engine
-            The sqlalchemy engine link to the db.
-        MJDrange :( , ) str or float, optional
-            Min and Max date to query if float assumed to be mjd, by default None
-
-        Returns
-        -------
-        pandas.DataFrame
-            Dataframe of the simulated observations.
-        """
         tstart = time.time()
-        query = "SELECT * FROM observations"
+        query = """
+        SELECT 
+          o.id AS observationId, 
+          o.LIBID, 
+          o.MJD, 
+          o.IDEXPT, 
+          o.BAND, 
+          o.GAIN, 
+          o.RDNOISE, 
+          o.SKYSIG, 
+          o.PSF1, 
+          o.PSF2, 
+          o.PSFRAT, 
+          o.ZP, 
+          o.ZPERR, 
+          o.MAG,
+          h.RA AS fieldRA,
+          h.DEC AS fieldDec,
+          h.REDSHIFT AS REDSHIFT,
+          h.PEAKMJD AS PEAKMJD,
+          h.TEMPLATE_ZPT AS TEMPLATE_ZPT,
+          h.TEMPLATE_SKYSIG AS TEMPLATE_SKYSIG
+        FROM observations o
+        JOIN lib_header h ON o.LIBID = h.LIBID
+        """
         if MJDrange is not None:
             if isinstance(MJDrange, str):
                 time_format = None
             else:
                 time_format = "mjd"
             MJDrange = Time(MJDrange, format=time_format)
-            query += f" WHERE observationStartMJD > {MJDrange.mjd[0]} AND observationStartMJD < {MJDrange[1].mjd}"
+            query += f" WHERE o.MJD > {MJDrange.mjd[0]} AND o.MJD < {MJDrange[1].mjd}"
 
         df = pd.read_sql(query, con=sql_engine)
-        df["_ra"] = np.radians(df.fieldRA)
-        df["_dec"] = np.radians(df.fieldDec)
+        df["_ra"] = np.radians(df.fieldRA.astype(float))
+        df["_dec"] = np.radians(df.fieldDec.astype(float))
         df.set_index("observationId", inplace=True)
         print(f"Read N = {len(df)} observations in {time.time() - tstart:.2f} seconds.")
-        return df.sort_values(by="observationStartMJD")
+        return df.sort_values(by="MJD")
 
     def _read_host_file(
         self,
@@ -213,87 +226,20 @@ class OpSimSurvey:
             hostdf["DEC_GAL"] = np.degrees(hostdf["dec"])
         hostdf.attrs["file"] = host_file
         return hostdf
-
-    def compute_hp_rep(
-        self,
-        nside=256,
-        minVisits=500,
-        maxVisits=100_000,
-        field_label_rules={"labels": ["WFD", "DDF"], "nobs_thresh": [1100]},
-    ):
-        """Compute a healpy version of the survey.
-
-        Parameters
-        ----------
-        nside : int, optional
-            Healpy nside, by default 256
-        minVisits : int, optional
-            Minimum number of observations required in the survey, by default 500
-        maxVisits : int, optional
-            Maximum number of observations required in the survey, by default 100000
+    def compute_field_rep(self, minVisits=1):
         """
-        ipix = np.arange(hp.nside2npix(nside))
-        hp_ra, hp_dec = np.radians(hp.pix2ang(nside, ipix, lonlat=True))
-
-        self._hp_rep = pd.DataFrame(dict(ipix=ipix, hp_ra=hp_ra, hp_dec=hp_dec))
-
-        # Compute number of visits
-        self._hp_rep["n_visits"] = self.tree.query_radius(
-            self.hp_rep[["hp_dec", "hp_ra"]].values,
-            r=self.__LSST_FIELD_RADIUS__,
-            count_only=True,
-        )
-
-        # Apply mask if needed
-        visits_mask = np.ones(len(self._hp_rep), dtype="bool")
-        if minVisits is not None:
-            visits_mask &= self._hp_rep["n_visits"] >= minVisits
-
-        if maxVisits is not None:
-            visits_mask &= self._hp_rep["n_visits"] <= maxVisits
-
-        self._hp_rep = self._hp_rep[visits_mask]
-        self._hp_rep.set_index("ipix", inplace=True)
-
-        self._hp_rep.attrs["nside"] = nside
-        self._hp_rep.attrs["survey_area_deg"] = hp.nside2pixarea(
-            self.hp_rep.attrs["nside"], degrees=True
-        ) * len(self._hp_rep)
-        self._hp_rep.attrs["survey_area_rad"] = hp.nside2pixarea(
-            self.hp_rep.attrs["nside"], degrees=False
-        ) * len(self._hp_rep)
-
-        if field_label_rules is not None:
-            if (
-                len(field_label_rules["labels"])
-                != len(field_label_rules["nobs_thresh"]) + 1
-            ):
-                raise ValueError(
-                    "'nobs_thresh' should contains len(labels) - 1 values'"
-                )
-            field_labels = np.empty_like(self._hp_rep["n_visits"], dtype="U5")
-            thresholds = [0, *field_label_rules["nobs_thresh"], np.inf]
-            for i, fname in enumerate(field_label_rules["labels"]):
-                mask = self._hp_rep["n_visits"] >= thresholds[i]
-                mask &= self._hp_rep["n_visits"] <= thresholds[i + 1]
-                field_labels[mask] = fname
-            self._hp_rep["field_label"] = field_labels
-        print(
-            f"Finished compute healpy representation, total number of fields : {len(self._hp_rep)}."
-        )
-
-    def plot_hp_rep(self, **hp_mollview_kwargs):
-        """Plot the healpy mollview of the survey representation.
-
-        Returns
-        -------
-        matplotlib.Figure
-            The mollview figure
+        Compute a field representation for DEBASS by grouping observations
+        by their field centers (fieldRA and fieldDec) and counting the number
+        of visits per field.
         """
-
-        ipix_map = np.zeros(hp.nside2npix(self.hp_rep.attrs["nside"]))
-        ipix_map[self.hp_rep.index.values] = self.hp_rep.n_visits.values
-        return hp.mollview(map=ipix_map, unit="N visits", **hp_mollview_kwargs)
+        field_rep = self.opsimdf.groupby(["fieldRA", "fieldDec"]).size().reset_index(name="n_visits")
+        # Optionally, filter out fields with very few observations
+        field_rep = field_rep[field_rep["n_visits"] >= minVisits]
+        # Add radians columns for spatial queries
+        field_rep["_ra"] = np.radians(field_rep["fieldRA"].astype(float))
+        field_rep["_dec"] = np.radians(field_rep["fieldDec"].astype(float))
+        self._field_rep = field_rep
+        print(f"Computed {len(self._field_rep)} unique fields from DEBASS observations.")
 
     def sample_survey(self, N_fields, random_seed=None, nworkers=10):
         """Sample Nfields inside the survey's healpy representation.
@@ -311,22 +257,20 @@ class OpSimSurvey:
         ------
         Random seed only apply on field sampling.
         """
-        if N_fields > len(self.hp_rep):
-            raise ValueError(
-                f"N_fields ({N_fields}) > survey fields ({len(self.hp_rep)})"
-            )
+        # Define the base columns you always need
+        header_columns = ['LIBID', 'fieldRA', 'fieldDec', 'REDSHIFT', 'PEAKMJD', 'TEMPLATE_ZPT', 'TEMPLATE_SKYSIG']
+        unique_fields = self.opsimdf[header_columns].drop_duplicates().reset_index(drop=True)
 
-        seed = np.random.SeedSequence(random_seed)
-        rng = np.random.default_rng(seed)
-
-        self._survey = self.hp_rep.sample(n=N_fields, replace=False, random_state=rng)
-        self._survey.reset_index(inplace=True)
-        self._survey.attrs = self.hp_rep.attrs.copy()
-        self._survey.attrs["N_fields"] = N_fields
+        if N_fields > len(unique_fields):
+            print(f"N_fields ({N_fields}) > available fields ({len(unique_fields)}); sampling all fields.")
+            N_fields = len(unique_fields)
+        rng = np.random.default_rng(random_seed)
+        self._survey = unique_fields.sample(n=N_fields, replace=False, random_state=rng)
 
         if self.host is not None:
             print("Compute survey hosts")
             self._survey_hosts = self.get_survey_hosts(nworkers=nworkers)
+
 
     def get_obs_from_coords(self, ra, dec, is_deg=True, formatobs=False, keep_keys=[]):
         """Get observations at ra, dec coordinates.
@@ -350,12 +294,12 @@ class OpSimSurvey:
             Dataframes of observations.
         """
         if is_deg:
-            ra = np.radians(ra)
-            dec = np.radians(dec)
+            ra = np.radians(np.array(ra, dtype=float))
+            dec = np.radians(np.array(dec, dtype=float))
 
         obs_idx = self.tree.query_radius(
             np.array([dec, ra]).T,
-            r=self.__LSST_FIELD_RADIUS__,
+            r=self.__DEBASS_FIELD_RADIUS__,
             count_only=False,
             return_distance=False,
         )
@@ -381,11 +325,15 @@ class OpSimSurvey:
             Dataframes of observations.
         """
         return self.get_obs_from_coords(
-            *self.survey[["hp_ra", "hp_dec"]].values.T,
-            is_deg=False,
+            *self.survey[["fieldRA", "fieldDec"]].values.T,
+            is_deg=True,
             formatobs=formatobs,
             keep_keys=keep_keys,
         )
+
+    def get_libid_field(self):
+        # Return a tuple (LIBID, (fieldRA, fieldDec)) for each survey field.
+        return zip(self.survey["LIBID"].values, self.survey[["fieldRA", "fieldDec"]].values)
 
     def get_survey_hosts(self, nworkers=10):
         """Get survey hosts.
@@ -406,130 +354,60 @@ class OpSimSurvey:
         if self.host is None:
             raise ValueError("No host file set.")
 
-        # Cut in 2 circles that intersect edge limits (0, 2PI)
-        _SPHERE_LIMIT_LOW_ = shp_geo.LineString([[0, -np.pi / 2], [0, np.pi / 2]])
-
-        _SPHERE_LIMIT_HIGH_ = shp_geo.LineString(
-            [[2 * np.pi, -np.pi / 2], [2 * np.pi, np.pi / 2]]
-        )
+        _RA = pd.to_numeric(self.survey.fieldRA, errors="coerce")
+        _Dec = pd.to_numeric(self.survey.fieldDec, errors="coerce")
+        libid = pd.to_numeric(self.survey.LIBID, errors="coerce")
+        _RA_adjusted = _RA - 180
+        rad_ra = np.radians(_RA_adjusted)
+        rad_dec = np.radians(_Dec)
 
         survey_fields = gpd.GeoDataFrame(
-            index=self.survey.index,
+            self.survey.copy(),
             geometry=gpd.points_from_xy(
-                self.survey.hp_ra.values, self.survey.hp_dec.values
-            ).buffer(self.__LSST_FIELD_RADIUS__),
+                rad_ra, rad_dec
+            ).buffer(self.__DEBASS_FIELD_RADIUS__)
         )
 
-        # scale for dec dependance
-        survey_fields = survey_fields.map(
-            lambda x: shp_aff.scale(
-                x, xfact=np.sqrt(2 / (1 + np.cos(2 * x.centroid.xy[1][0])))
-            )
-        )
+        # Use the same host joiner and subdivide methods as before.
+        host_joiner_func = partial(def_host_joiner, survey_fields)
 
-        # mask for edge effect
-        mask = survey_fields.intersects(_SPHERE_LIMIT_LOW_)
-        survey_fields[mask] = survey_fields[mask].translate(2 * np.pi)
-        mask |= survey_fields.intersects(_SPHERE_LIMIT_HIGH_)
-        survey_fields.loc[mask, "geometry"] = gpd.GeoSeries(
-            data=[ut.format_poly(p) for p in survey_fields[mask].geometry],
-            index=survey_fields[mask].index,
-        )
+        nsub = 5 if nworkers == 1 else nworkers
+        sdfs = ut.df_subdiviser(self.host, Nsub=nsub)
 
-        host_joiner = partial(ut.host_joiner, survey_fields)
-
-        sdfs = ut.df_subdiviser(self.host, Nsub=nworkers)
-
-        with Pool(nworkers) as p:
-            res = p.map(host_joiner, sdfs)
+        # Process sequentially
+        res = []
+        for sdf in sdfs:
+            res.append(host_joiner_func(sdf))
 
         survey_host = pd.concat(res)
-
         return survey_host
 
     def formatObs(self, OpSimObs, keep_keys=[]):
-        """Format function to get quantities of interest for simulation.
+        """Format DEBASS SIMLIB observation for simulation.
 
-        Parameters
-        ----------
-        OpSimObs : pandas.DataFrame
-            Dataframe of OpSim output
-        keep_keys : list(str)
-            List of keys to keep in addition to formatted quantities
+        For DEBASS SIMLIB, the necessary quantities are provided directly:
+        - 'MJD' for the exposure time,
+        - 'PSF1' as the PSF,
+        - 'ZP' as the zero point,
+        - 'SKYSIG' as the sky noise,
+        - 'BAND' as the filter.
 
-        Returns
-        -------
-        pandas.DataFrame
-            Dataframe that contains quantities for simulation.
-
-        Notes
-        -----
-        Quantities are obtained following arxiv:1905.02887
-
-        Details of the calculs:
-
-        The :math:`\sigma_\mathrm{PSF}` in units of :math:`\mathrm{arcsec}^{-1}` is obtained as
-
-        .. math::
-            \sigma_\mathrm{PSF} = \\frac{\mathbf{seeingFwhmEff}}{2\sqrt{2\ln2}}.
-
-        The :math:`\mathbf{PSF}` is computed in units of :math:`\mathrm{pixel}^{-1}` as
-
-        .. math::
-            \mathbf{PSF} = \\frac{\sigma_\mathrm{PSF}}{\mathrm{PixelSize}},
-
-        where :math:`\mathrm{PixelSize}` is the pixel size in :math:`\mathrm{arcsec}^{-1}`.
-
-        The zero-point :math:`\mathbf{ZPT}` is computed as
-
-        .. math::
-            \mathbf{ZPT} = 2 m_5 - m_\mathrm{sky} + 2.5 \log\left[25 A \left(1 + A^{-1}10^{-0.4(m_5-m_\mathrm{sky})}\\right)\\right],
-
-        where :math:`m_5 = \mathbf{fiveSigmaDepth}`, :math:`m_\mathrm{sky} = \mathbf{skyBrightness}` and :math:`A` is the noise equivalent area given by
-        :math:`A = 4 \pi \sigma_\mathrm{PSF}^2`.
-
-        The sky noise :math:`\mathbf{SKYSIG}` in unit of :math:`\mathrm{ADU}.\mathrm{pixel}^{-1}` is computed such as
-
-        .. math::
-            \mathbf{SKYSIG}^2 = 10^{-0.4\left(m_\mathrm{sky} - \mathbf{ZPT}\\right)} \\times \mathrm{PixelSize}^2.
+        Additional keys in keep_keys will be preserved.
         """
-        sigPSF = OpSimObs["seeingFwhmEff"] / (2 * np.sqrt(2 * np.log(2)))
-
-        # PSF in pixels^{-1}
-        PSF = sigPSF / self.__LSST_pixelSize__
-
-        # Noise Effective Area in arcsec^{-2}
-        NoiseArea = 4 * np.pi * sigPSF**2
-
-        # ZPT
-        dmag = OpSimObs["fiveSigmaDepth"] - OpSimObs["skyBrightness"]
-
-        ZPT = 2 * OpSimObs["fiveSigmaDepth"] - OpSimObs["skyBrightness"]
-        ZPT += 2.5 * np.log10(25 * NoiseArea)
-        ZPT += 2.5 * np.log10(1 + 10 ** (-0.4 * dmag) / NoiseArea)
-
-        # SKYSIG
-        dskymag = OpSimObs["skyBrightness"] - ZPT
-        SKYSIG = np.sqrt(10 ** (-0.4 * dskymag) * self.__LSST_pixelSize__**2)
-
         formatobs_df = pd.DataFrame(
             {
-                "expMJD": OpSimObs["observationStartMJD"],
-                "PSF": PSF,
-                "ZPT": ZPT,
-                "SKYSIG": SKYSIG,
-                "BAND": OpSimObs["filter"],
+                "expMJD": OpSimObs["MJD"],
+                "PSF": OpSimObs["PSF1"],
+                "ZPT": OpSimObs["ZP"],
+                "SKYSIG": OpSimObs["SKYSIG"],
+                "BAND": OpSimObs["BAND"],
+                "RDNOISE": OpSimObs["RDNOISE"],
+                "GAIN": OpSimObs["GAIN"],
+                "IDEXPT": OpSimObs["IDEXPT"],  # ID of the exposure
                 **{k: OpSimObs[k] for k in keep_keys},
             }
         ).reset_index(names="ObsID")
-
         return formatobs_df
-
-    @property
-    def hp_rep(self):
-        if self._hp_rep is None:
-            raise ValueError("hp_rep not set. Please run compute_hpix_survey before.")
-        return self._hp_rep
 
     @property
     def survey(self):
